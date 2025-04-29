@@ -1,48 +1,57 @@
-# main.py
-
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-import openai
-import os
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+import os
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import openai
 
-# Load environment variables from .env file
 load_dotenv()
 
 app = FastAPI()
 
-# Create the OpenAI client using the API Key from environment
-openai_client = openai.OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
-)
+# Setup rate limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Define your secret API Key for client apps
-ALLOWED_API_KEY = "your-super-secret-key"
+# Load your keys
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+VALID_API_KEYS = os.getenv("VALID_API_KEYS", "").split(",")
 
-# Define the request body structure
-class GenerateRequest(BaseModel):
-    prompt: str
+# Setup OpenAI client
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+# Validate user API key
+def validate_key(request: Request):
+    api_key = request.headers.get("x-api-key")
+    if api_key not in VALID_API_KEYS:
+        raise HTTPException(status_code=401, detail="Missing or invalid API key.")
 
 @app.get("/")
-def read_root():
-    return {"message": "Welcome to your Smart Backend!"}
+@limiter.limit("5/minute;100/day")
+async def root(request: Request):
+    validate_key(request)
+    return {"message": "Smart Backend is running ✅"}
 
 @app.post("/generate")
-async def generate_text(request: Request, body: GenerateRequest):
-    # 1. Check API Key from client
-    api_key = request.headers.get("X-API-Key")
-    if api_key != ALLOWED_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
+@limiter.limit("5/minute;100/day")
+async def generate(request: Request, body: dict):
+    validate_key(request)
+    
+    prompt = body.get("prompt")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing 'prompt' in request body.")
 
-    # 2. If API Key valid, call OpenAI API
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": body.prompt}],
-            max_tokens=500,
-            temperature=0.7
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ]
         )
-        generated_text = response.choices[0].message.content
-        return {"response": generated_text}
+        return {"response": response.choices[0].message.content}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(content={"error": str(e)}, status_code=500)
