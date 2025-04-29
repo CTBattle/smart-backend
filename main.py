@@ -94,3 +94,29 @@ async def generate_code(request: Request):
 @app.post("/reset")
 async def reset_counters():
     """Manually reset all counters. (Eventually we'll automate monthly reset.)"""
+    for key in request_counts.keys():
+        request_counts[key] = 0
+    return {"message": "All counters have been reset."}
+
+@app.get("/usage")
+async def get_usage(request: Request):
+    """Returns how many requests the current API key has used."""
+    api_key = request.headers.get("X-API-KEY")
+
+    if not api_key or api_key not in VALID_API_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+    count = request_counts.get(api_key, 0)
+    plan = get_plan(api_key)
+
+    if not plan:
+        raise HTTPException(status_code=403, detail="Unauthorized API key.")
+
+    limit = PLAN_LIMITS[plan]
+    remaining = limit - count if limit != float('inf') else "Unlimited"
+
+    return {
+        "plan": plan,
+        "used": count,
+        "remaining": remaining
+    }
