@@ -3,41 +3,41 @@ from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from dotenv import load_dotenv
-import stripe
 import openai
+import stripe
 import os
 
 # Load environment variables
 load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# Setup FastAPI and limiter
+# Setup
 app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(429, _rate_limit_exceeded_handler)
 
-# Setup OpenAI
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# OpenAI client
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# Setup Stripe
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+# Stripe client
+stripe.api_key = STRIPE_SECRET_KEY
 
-# Webhook secret (Stripe sends events to this)
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-# Load valid keys and tiers
+# Valid API keys
 VALID_API_KEYS = os.getenv("VALID_API_KEYS", "").split(",")
 
-STARTER_KEYS = os.getenv("STARTER_KEYS", "").split(",")
-PRO_KEYS = os.getenv("PRO_KEYS", "").split(",")
-ENTERPRISE_KEYS = os.getenv("ENTERPRISE_KEYS", "").split(",")
+# Key plans
+STARTER_KEYS = [f"battlekey{str(i).zfill(3)}" for i in range(1, 101)]
+PRO_KEYS = [f"prokey{str(i).zfill(3)}" for i in range(1, 101)]
+ENTERPRISE_KEYS = [f"enterprisekey{str(i).zfill(3)}" for i in range(1, 101)]
 
 PLAN_LIMITS = {
-    "starter": 10_000,
-    "pro": 100_000,
-    "enterprise": float('inf')
+    "starter": 10000,
+    "pro": 100000,
+    "enterprise": float("inf")
 }
-
 request_counts = {}
 
 def get_plan(key):
@@ -49,17 +49,8 @@ def get_plan(key):
         return "enterprise"
     return None
 
-# ✅ Health check or root welcome route
-@app.get("/")
-async def read_root():
-    return {"message": "Welcome to Smart Backend API!"}
-
-# ✅ API key + rate limit middleware
 @app.middleware("http")
 async def check_api_key_and_limit(request: Request, call_next):
-    if request.url.path.startswith("/webhook"):
-        return await call_next(request)
-
     api_key = request.headers.get("X-API-KEY")
     if not api_key or api_key not in VALID_API_KEYS:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
@@ -73,61 +64,55 @@ async def check_api_key_and_limit(request: Request, call_next):
         raise HTTPException(status_code=429, detail="Monthly limit exceeded.")
 
     request_counts[api_key] = count
-    return await call_next(request)
+    response = await call_next(request)
+    return response
 
-# ✅ Code generation endpoint
+@app.get("/")
+def root():
+    return {"message": "Smart Backend API is live!"}
+
 @app.post("/generate")
 async def generate_code(request: Request):
-    body = await request.json()
-    prompt = body.get("prompt")
+    data = await request.json()
+    prompt = data.get("prompt")
     if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt is required.")
+        raise HTTPException(status_code=400, detail="Missing prompt.")
 
     response = openai_client.chat.completions.create(
         model="gpt-4",
         messages=[{"role": "user", "content": prompt}]
     )
 
-    return {"generated_code": response.choices[0].message.content.strip()}
+    code = response.choices[0].message.content.strip()
+    return {"generated_code": code}
 
-# ✅ Manual reset (admin/debug)
-@app.post("/reset")
-async def reset_counters():
-    request_counts.clear()
-    return {"message": "Request counters reset."}
-
-# ✅ Usage report
 @app.get("/usage")
 async def get_usage(request: Request):
     api_key = request.headers.get("X-API-KEY")
     if not api_key or api_key not in VALID_API_KEYS:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
-
     plan = get_plan(api_key)
-    if not plan:
-        raise HTTPException(status_code=403, detail="Unauthorized API key.")
-
-    used = request_counts.get(api_key, 0)
+    count = request_counts.get(api_key, 0)
     limit = PLAN_LIMITS[plan]
-    remaining = "Unlimited" if limit == float('inf') else limit - used
+    remaining = limit - count if limit != float("inf") else "Unlimited"
+    return {"plan": plan, "used": count, "remaining": remaining}
 
-    return {"plan": plan, "used": used, "remaining": remaining}
-
-# ✅ Stripe Webhook
 @app.post("/webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
+
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload.")
     except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid payload")
+        raise HTTPException(status_code=400, detail="Invalid signature.")
 
     if event["type"] == "checkout.session.completed":
-        print("✅ Payment complete:", event["data"]["object"]["id"])
+        session = event["data"]["object"]
+        print("✅ Checkout completed:", session)
+    else:
+        print("Unhandled event type:", event["type"])
 
-    return JSONResponse(status_code=200, content={"message": "Webhook received."})
+    return {"status": "success"}
